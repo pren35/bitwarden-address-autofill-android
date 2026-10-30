@@ -1,0 +1,63 @@
+From 315e0f0682969ea4307cd63b2a389d1852d035b2 Mon Sep 17 00:00:00 2001
+From: JP <pren35@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 20:52:53 +0000
+Subject: [PATCH] Always enable identity (address) autofill
+
+Bitwarden already ships identity autofill for Android, but keeps it
+switched off behind the pm-38138-mobile-identity-autofill feature flag.
+This personal build forces that flag on, whatever the server says.
+---
+ .../manager/FeatureFlagManagerImpl.kt         |  6 ++++++
+ .../manager/FeatureFlagManagerTest.kt         | 19 +++++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerImpl.kt b/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerImpl.kt
+index 9483d95..858c6d0 100644
+--- a/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerImpl.kt
++++ b/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerImpl.kt
+@@ -55,6 +55,12 @@ private val ServerConfigRepository.isCipherKeyEncryptionEnabled: Boolean
+  * or if the value is null, the default value will be returned.
+  */
+ fun <T : Any> ServerConfig?.getFlagValueOrDefault(key: FlagKey<T>): T {
++    // Personal build: always turn on Bitwarden's built-in identity (address) autofill, whatever
++    // the server says.
++    if (key == FlagKey.IdentityAutofill) {
++        @Suppress("UNCHECKED_CAST")
++        return true as T
++    }
+     val defaultValue = key.defaultValue
+     return this
+         ?.serverData
+diff --git a/app/src/test/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerTest.kt b/app/src/test/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerTest.kt
+index ccb2a40..579c699 100644
+--- a/app/src/test/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerTest.kt
++++ b/app/src/test/kotlin/com/x8bit/bitwarden/data/platform/manager/FeatureFlagManagerTest.kt
+@@ -136,6 +136,25 @@ class FeatureFlagManagerTest {
+         assertFalse(flagValue)
+     }
+ 
++    @Test
++    fun `getFeatureFlag IdentityAutofill should always be true even if the server disables it`() =
++        runTest {
++            fakeServerConfigRepository.serverConfigValue = SERVER_CONFIG.copy(
++                serverData = SERVER_CONFIG
++                    .serverData
++                    .copy(
++                        featureStates = mapOf(
++                            FlagKey.IdentityAutofill.keyName to JsonPrimitive(false),
++                        ),
++                    ),
++            )
++
++            assertTrue(
++                manager.getFeatureFlag(key = FlagKey.IdentityAutofill, forceRefresh = false),
++            )
++            assertTrue(manager.getFeatureFlag(key = FlagKey.IdentityAutofill))
++        }
++
+     @Test
+     fun `getFeatureFlag Int should return value if exists`() = runTest {
+         fakeServerConfigRepository.serverConfigValue = SERVER_CONFIG.copy(
+-- 
+2.43.0
+

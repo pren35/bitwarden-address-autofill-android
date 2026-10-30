@@ -1,0 +1,75 @@
+# Test-builds every pull request, so you can see a green tick before you click Merge.
+# Nothing is signed or published here, so nothing from this can reach your phone.
+name: Check patches
+
+on:
+  pull_request:
+  workflow_dispatch:          # lets you press "Run workflow" by hand
+
+permissions:
+  contents: read
+  packages: read              # Bitwarden's SDK may come from GitHub Packages
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: https://github.com/bitwarden/android
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Get this repo (workflow + patches)
+        uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Find Bitwarden's latest password-manager release
+        id: ver
+        run: |
+          TAG=$(git ls-remote --tags --refs "$UPSTREAM" \
+                | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+-bwpm$' | sort -V | tail -1)
+          [ -n "$TAG" ] || { echo "Could not find an upstream tag"; exit 1; }
+          echo "Checking against $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download Bitwarden source at that release
+        run: |
+          git clone --depth 1 --branch "${{ steps.ver.outputs.tag }}" "$UPSTREAM" src
+          cd src
+          git config user.name  "patch-bot"
+          git config user.email "patch-bot@users.noreply.github.com"
+
+      - name: Apply your patches
+        working-directory: src
+        run: |
+          shopt -s nullglob
+          for p in ../mine/patches/*.patch; do
+            echo "Applying $p"
+            if ! git am --3way "$p"; then
+              echo "::error::Patch $(basename "$p") does not apply to ${{ steps.ver.outputs.tag }}."
+              git am --show-current-patch=diff || true
+              exit 1
+            fi
+          done
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Compile and run the autofill tests
+        working-directory: src
+        env:
+          GITHUB_TOKEN: ${{ secrets.PACKAGES_TOKEN || github.token }}
+        run: |
+          ./gradlew --no-daemon :app:testFdroidDebugUnitTest \
+            --tests 'com.x8bit.bitwarden.data.platform.manager.FeatureFlagManagerTest' \
+            --tests 'com.x8bit.bitwarden.data.autofill.*'
