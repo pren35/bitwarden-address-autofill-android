@@ -83,7 +83,7 @@ jobs:
 
       - name: Set up Java
         if: steps.ver.outputs.skip == 'false'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
@@ -94,7 +94,26 @@ jobs:
 
       - name: Restore signing key
         if: steps.ver.outputs.skip == 'false'
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+        env:
+          KS: ${{ secrets.KEYSTORE_BASE64 }}
+          PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          AL: ${{ secrets.KEY_ALIAS }}
+        run: |
+          # Tolerate copy-paste mistakes (extra spaces, line breaks, labels, or the whole file pasted).
+          trim() { printf '%s' "$1" | tr -d ' \r\t'; }
+          after_label() { trim "$1" | awk -v L="$2" 'f && NF {print; exit} $0==L {f=1}'; }
+          KS_CLEAN=$(after_label "$KS" KEYSTORE_BASE64)
+          [ -n "$KS_CLEAN" ] || KS_CLEAN=$(trim "$KS" | tr -d '\n')
+          PW_CLEAN=$(after_label "$PW" KEYSTORE_PASSWORD)
+          [ -n "$PW_CLEAN" ] || PW_CLEAN=$(trim "$PW" | tr -d '\n')
+          AL_CLEAN=$(after_label "$AL" KEY_ALIAS)
+          [ -n "$AL_CLEAN" ] || AL_CLEAN=$(trim "$AL" | tr -d '\n')
+          echo "Key data: ${#KS_CLEAN} characters (expected 5688). Password: ${#PW_CLEAN} characters (expected 32). Alias: ${#AL_CLEAN} characters (expected 6)."
+          printf '%s' "$KS_CLEAN" | base64 -d > "$RUNNER_TEMP/release.jks" \
+            || { echo "::error::KEYSTORE_BASE64 secret is not valid. Re-add it from KEYSTORE_BASE64.txt."; exit 1; }
+          echo "::add-mask::$PW_CLEAN"
+          echo "KS_PASS=$PW_CLEAN" >> "$GITHUB_ENV"
+          echo "KS_ALIAS=$AL_CLEAN" >> "$GITHUB_ENV"
 
       - name: Build signed APK
         if: steps.ver.outputs.skip == 'false'
@@ -105,9 +124,9 @@ jobs:
         run: |
           ./gradlew --no-daemon :app:assembleFdroidRelease \
             -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.jks" \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEYSTORE_PASSWORD }}"
+            -Pandroid.injected.signing.store.password="$KS_PASS" \
+            -Pandroid.injected.signing.key.alias="$KS_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KS_PASS"
           APK=$(find app/build/outputs/apk/fdroid/release -name '*.apk' | head -1)
           cp "$APK" "$GITHUB_WORKSPACE/bitwarden-addr-${{ steps.ver.outputs.tag }}.apk"
 
