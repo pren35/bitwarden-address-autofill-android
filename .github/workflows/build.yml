@@ -1,0 +1,124 @@
+# Builds Bitwarden for Android with your own patches applied.
+# Runs every day; only builds when Bitwarden has published a new release.
+name: Build patched Bitwarden
+
+on:
+  schedule:
+    - cron: "17 9 * * *"     # daily, 09:17 UTC
+  workflow_dispatch:          # lets you press "Run workflow" by hand
+    inputs:
+      force:
+        description: "Rebuild even if this version was already built"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write             # needed to publish GitHub Releases
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/bitwarden/android
+  ID_SUFFIX: ".addr"          # installs next to the Play Store app instead of replacing it
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Get this repo (workflow + patches)
+        uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Find Bitwarden's latest password-manager release
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(git ls-remote --tags --refs "$UPSTREAM" \
+                | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+-bwpm$' | sort -V | tail -1)
+          [ -n "$TAG" ] || { echo "Could not find an upstream tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+             && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Already built $TAG - nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version $TAG - building."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Bitwarden source at that release
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          git clone --depth 1 --branch "${{ steps.ver.outputs.tag }}" "$UPSTREAM" src
+          cd src
+          git config user.name  "patch-bot"
+          git config user.email "patch-bot@users.noreply.github.com"
+
+      - name: Apply your patches
+        if: steps.ver.outputs.skip == 'false'
+        working-directory: src
+        run: |
+          shopt -s nullglob
+          PATCHES=(../mine/patches/*.patch)
+          if [ ${#PATCHES[@]} -eq 0 ]; then
+            echo "No patches yet - building stock Bitwarden."
+          fi
+          for p in "${PATCHES[@]}"; do
+            echo "Applying $p"
+            if ! git am --3way "$p"; then
+              echo "::error::Patch $(basename "$p") no longer applies to ${{ steps.ver.outputs.tag }}. Update it by hand."
+              git am --show-current-patch=diff || true
+              exit 1
+            fi
+          done
+          # Give the app its own package name so it can sit beside the Play Store version.
+          sed -i '0,/^        release {/s//        release {\n            applicationIdSuffix = "'"$ID_SUFFIX"'"/' app/build.gradle.kts
+          grep -q "applicationIdSuffix = \"$ID_SUFFIX\"" app/build.gradle.kts \
+            || { echo "::error::Could not set package name suffix"; exit 1; }
+
+      - name: Set up Java
+        if: steps.ver.outputs.skip == 'false'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        if: steps.ver.outputs.skip == 'false'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore signing key
+        if: steps.ver.outputs.skip == 'false'
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Build signed APK
+        if: steps.ver.outputs.skip == 'false'
+        working-directory: src
+        env:
+          # Bitwarden's SDK is downloaded from GitHub Packages, which needs a token.
+          GITHUB_TOKEN: ${{ secrets.PACKAGES_TOKEN || github.token }}
+        run: |
+          ./gradlew --no-daemon :app:assembleFdroidRelease \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.jks" \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEYSTORE_PASSWORD }}"
+          APK=$(find app/build/outputs/apk/fdroid/release -name '*.apk' | head -1)
+          cp "$APK" "$GITHUB_WORKSPACE/bitwarden-addr-${{ steps.ver.outputs.tag }}.apk"
+
+      - name: Publish release
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --title "Bitwarden $TAG + address autofill" \
+            --notes "Built from bitwarden/android $TAG with the patches in /patches." \
+            "$GITHUB_WORKSPACE"/bitwarden-addr-*.apk
